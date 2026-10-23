@@ -229,11 +229,14 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         ggml_build_forward_expand(gf, embd);
     }
 
-    // LM head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // LM head (skipped in embeddings mode: decision readouts read result_norm,
+    // and the zero-padded n_vocab-wide head would otherwise run on the CPU)
+    if (!cparams.embeddings) {
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
