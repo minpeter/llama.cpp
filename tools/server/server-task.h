@@ -163,6 +163,23 @@ struct server_task {
     std::vector<server_task> child_tasks;
     // if set on a parent, the children have their own prompt and only share its first n_tokens_shared tokens
     int32_t n_tokens_shared = 0;
+    // decision tasks of one request processed one after another on a single slot: the prefix that all of them
+    // share. A context checkpoint is created at this position so that the next task restores it instead of
+    // re-processing the whole prompt (needed for recurrent/hybrid and SWA memory, which cannot be rolled back)
+    int32_t n_tokens_ckpt = 0;
+    // state_bidir: the first bidir_n prompt positions attend bidirectionally within blocks of bidir_block
+    int32_t bidir_n     = 0;
+    int32_t bidir_block = 0;
+    // embedding tasks (pooling none): spans [start, end) of prompt positions whose states are read, see
+    // server_context_impl::collect_embd_reads(). The response is one vector per span (mean over the span)
+    std::vector<std::pair<int32_t, int32_t>> embd_reads;
+    int32_t embd_reads_first() const {
+        int32_t r = -1;
+        for (const auto & s : embd_reads) {
+            r = r < 0 ? s.first : std::min(r, s.first);
+        }
+        return r;
+    }
 
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
@@ -520,6 +537,9 @@ struct server_task_result_cmpl_partial : server_task_result {
 
 struct server_task_result_embd : server_task_result {
     std::vector<std::vector<float>> embedding;
+    // embd_reads: the layers captured ("hidden" of the response) and their span means
+    std::vector<int32_t> hidden_layers;
+    std::vector<std::vector<std::vector<float>>> hidden; // [layer][span][n_embd]
 
     int32_t n_tokens;
 

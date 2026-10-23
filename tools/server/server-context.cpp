@@ -5,6 +5,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-decision.h"
+#include "../../src/llama-model.h" // embd_reads: output_norm weight and eps
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -339,6 +340,14 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // embd_reads: running sums per span, [span][n_embd], and the number of tokens seen per span
+    std::vector<std::vector<float>> embd_read_final;
+    std::vector<std::vector<std::vector<float>>> embd_read_hidden; // [layer][span][n_embd]
+    std::vector<int32_t> embd_read_cnt;
+
+    // state_bidir: the bidirectional prefix length the cached prompt was computed with
+    int32_t bidir_n_cached = 0;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -516,6 +525,10 @@ struct server_slot {
         }
         // a decision task reads its outputs from the last batch
         if (task->type == SERVER_TASK_TYPE_DECISION) {
+            return true;
+        }
+        // embd_reads: the states are collected view by view
+        if (task->type == SERVER_TASK_TYPE_EMBEDDING && !task->embd_reads.empty() && llama_get_causal_attn(ctx_tgt)) {
             return true;
         }
         return false;
@@ -1067,6 +1080,91 @@ private:
 
     server_batch batch;
 
+    // embd_reads: residual stream after the layers of LLAMA_EMBD_HIDDEN_LAYERS (graph tensors "l_out-<il>"),
+    // copied by the eval callback during llama_decode: n_embd columns per token, ubatches appended in order
+    std::vector<int32_t> embd_hidden_layers;
+    std::map<int32_t, std::vector<float>> embd_hidden_buf;
+    std::vector<float> embd_output_norm; // output_norm.weight on the host
+    float embd_norm_eps = 1e-6f;
+
+    static bool embd_eval_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+        auto * self = (server_context_impl *) user_data;
+        const char * name = ggml_get_name(t);
+        if (strncmp(name, "l_out-", 6) != 0) {
+            return false;
+        }
+        const int32_t il = atoi(name + 6);
+        if (std::find(self->embd_hidden_layers.begin(), self->embd_hidden_layers.end(), il) == self->embd_hidden_layers.end()) {
+            return false;
+        }
+        if (ask) {
+            return true;
+        }
+        GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t));
+        auto & buf = self->embd_hidden_buf[il];
+        const size_t n = ggml_nelements(t);
+        const size_t off = buf.size();
+        buf.resize(off + n);
+        ggml_backend_tensor_get(t, buf.data() + off, 0, n * sizeof(float));
+        return true;
+    }
+
+    // after one llama_decode of `view`: add output_norm(state) of every token inside a read span to the sums
+    void collect_embd_reads(const common_batch & view) {
+        const int n_embd = llama_model_n_embd_out(model_tgt);
+        std::vector<float> tmp(n_embd);
+        for (auto & slot : slots) {
+            if (!slot.is_processing() || slot.task->type != SERVER_TASK_TYPE_EMBEDDING || slot.task->embd_reads.empty()) {
+                continue;
+            }
+            const auto & spans = slot.task->embd_reads;
+            if (slot.embd_read_cnt.size() != spans.size()) {
+                slot.embd_read_cnt.assign(spans.size(), 0);
+                slot.embd_read_final.assign(spans.size(), std::vector<float>(n_embd, 0.0f));
+                slot.embd_read_hidden.assign(embd_hidden_layers.size(), slot.embd_read_final);
+            }
+            for (size_t l = 0; l < embd_hidden_layers.size(); ++l) {
+                const auto & buf = embd_hidden_buf[embd_hidden_layers[l]];
+                if (buf.size() != (size_t) n_embd * view.size()) {
+                    throw std::runtime_error(string_format("embd_reads: captured %zu values for layer %d, expected %zu",
+                                                           buf.size(), embd_hidden_layers[l], (size_t) n_embd * view.size()));
+                }
+            }
+            for (int i = 0; i < view.size(); ++i) {
+                if (!view.tokens[i].output || view.tokens[i].seq_id != slot.id) {
+                    continue;
+                }
+                const llama_pos pos = view.tokens[i].pos[0];
+                for (size_t s = 0; s < spans.size(); ++s) {
+                    if (pos < spans[s].first || pos >= spans[s].second) {
+                        continue;
+                    }
+                    const float * embd = llama_get_embeddings_ith(ctx_tgt, i);
+                    if (embd == nullptr) {
+                        throw std::runtime_error(string_format("embd_reads: no embedding for token at pos %d", (int) pos));
+                    }
+                    auto & sum = slot.embd_read_final[s];
+                    for (int k = 0; k < n_embd; ++k) {
+                        sum[k] += embd[k];
+                    }
+                    for (size_t l = 0; l < embd_hidden_layers.size(); ++l) {
+                        const float * h = embd_hidden_buf[embd_hidden_layers[l]].data() + (size_t) i * n_embd;
+                        double ss = 0.0;
+                        for (int k = 0; k < n_embd; ++k) {
+                            ss += (double) h[k] * h[k];
+                        }
+                        const float scale = 1.0f / sqrtf((float) (ss / n_embd) + embd_norm_eps);
+                        auto & hsum = slot.embd_read_hidden[l][s];
+                        for (int k = 0; k < n_embd; ++k) {
+                            hsum[k] += h[k] * scale * embd_output_norm[k];
+                        }
+                    }
+                    slot.embd_read_cnt[s]++;
+                }
+            }
+        }
+    }
+
     llama_model   * model_dft = nullptr;
     llama_context * ctx_dft   = nullptr;
 
@@ -1287,6 +1385,19 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        if (const char * env = getenv("LLAMA_EMBD_HIDDEN_LAYERS")) {
+            for (const auto & tok : string_split<std::string>(env, ',')) {
+                if (!tok.empty()) {
+                    embd_hidden_layers.push_back(std::stoi(tok));
+                }
+            }
+            if (!embd_hidden_layers.empty()) {
+                params_base.cb_eval = embd_eval_cb;
+                params_base.cb_eval_user_data = this;
+                SRV_INF("embd_reads: capturing %zu hidden layers\n", embd_hidden_layers.size());
+            }
+        }
+
         llama_init = common_init_from_params(params_base);
 
         model_tgt = llama_init->model();
@@ -1295,6 +1406,18 @@ private:
         if (model_tgt == nullptr) {
             SRV_ERR("failed to load model, '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        if (!embd_hidden_layers.empty()) {
+            const ggml_tensor * w = model_tgt->output_norm;
+            if (w == nullptr || w->type != GGML_TYPE_F32 || ggml_nelements(w) != llama_model_n_embd_out(model_tgt)) {
+                SRV_ERR("%s", "embd_reads: the model has no f32 output_norm of n_embd elements\n");
+                return false;
+            }
+            embd_output_norm.resize(ggml_nelements(w));
+            ggml_backend_tensor_get(w, embd_output_norm.data(), 0, ggml_nbytes(w));
+            embd_norm_eps = model_tgt->hparams.f_norm_rms_eps;
+            SRV_INF("embd_reads: output_norm read (%zu), rms eps %g\n", embd_output_norm.size(), embd_norm_eps);
         }
 
         if (ctx_tgt == nullptr) {
@@ -2055,6 +2178,9 @@ private:
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
+        slot.embd_read_cnt.clear();
+        slot.embd_read_final.clear();
+        slot.embd_read_hidden.clear();
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
             slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -2425,6 +2551,42 @@ private:
         res->res_type  = slot.task->params.res_type;
 
         const int n_embd_out = llama_model_n_embd_out(model_tgt);
+
+        if (!slot.task->embd_reads.empty()) {
+            const auto & spans = slot.task->embd_reads;
+            if (slot.embd_read_cnt.size() != spans.size()) {
+                send_error(slot, "embd_reads: no state was collected", ERROR_TYPE_SERVER);
+                return;
+            }
+            for (size_t s = 0; s < spans.size(); ++s) {
+                if (slot.embd_read_cnt[s] != spans[s].second - spans[s].first) {
+                    send_error(slot, string_format("embd_reads: span [%d, %d) has %d of %d tokens evaluated (prompt cache reuse?)",
+                                                   spans[s].first, spans[s].second, slot.embd_read_cnt[s], spans[s].second - spans[s].first),
+                               ERROR_TYPE_INVALID_REQUEST);
+                    return;
+                }
+            }
+            auto mean = [&](const std::vector<float> & sum, int32_t cnt) {
+                std::vector<float> v(sum);
+                for (auto & x : v) {
+                    x /= (float) cnt;
+                }
+                return v;
+            };
+            for (size_t s = 0; s < spans.size(); ++s) {
+                res->embedding.push_back(mean(slot.embd_read_final[s], slot.embd_read_cnt[s]));
+            }
+            res->hidden_layers = embd_hidden_layers;
+            res->hidden.resize(embd_hidden_layers.size());
+            for (size_t l = 0; l < embd_hidden_layers.size(); ++l) {
+                for (size_t s = 0; s < spans.size(); ++s) {
+                    res->hidden[l].push_back(mean(slot.embd_read_hidden[l][s], slot.embd_read_cnt[s]));
+                }
+            }
+            SLT_DBG(slot, "%s", "sending span embeddings\n");
+            queue_results.send(std::move(res));
+            return;
+        }
 
         std::vector<float> embd_res(n_embd_out, 0.0f);
 
@@ -3990,7 +4152,8 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
+                            // n_tokens_ckpt: a task with a shared-prefix checkpoint keeps its prompt in the cache
+                            if (slot.task->params.cache_prompt && (!slot.task->is_stateless() || slot.task->n_tokens_ckpt > 0)) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -4002,6 +4165,16 @@ private:
                                 // the outputs of a decision are read from the batch, so its first position must be evaluated
                                 if (n_decision_first >= 0) {
                                     n_past = std::min(n_past, n_decision_first);
+                                }
+                                // state_bidir: tokens inside the prefix depend on later prefix tokens, reuse all or none,
+                                // and only from a prompt computed with the same prefix (a causal one is not reusable either)
+                                if ((slot.task->bidir_n > 0 || slot.bidir_n_cached > 0) &&
+                                    (n_past < slot.task->bidir_n || slot.task->bidir_n != slot.bidir_n_cached)) {
+                                    n_past = 0;
+                                }
+                                // embd_reads: same for the first read position
+                                if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING && slot.task->embd_reads_first() >= 0) {
+                                    n_past = std::min(n_past, slot.task->embd_reads_first());
                                 }
 
                                 // if there is an alora invoked, don't cache after the invocation start
@@ -4073,6 +4246,8 @@ private:
                                 // if we don't cache the prompt, we have to remove all previous tokens
                                 n_past = 0;
                             }
+
+                            slot.bidir_n_cached = slot.task->bidir_n; // state_bidir
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
@@ -4280,8 +4455,10 @@ private:
 
                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
 
-                    // make checkpoints only for completion tasks
-                    do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+                    // make checkpoints only for completion tasks, and for decision tasks that share a prefix with
+                    // the other tasks of their request (checkpoint at the end of the shared prefix only)
+                    const bool is_decision_ckpt = slot.task->n_tokens_ckpt > 0;
+                    do_checkpoint = do_checkpoint && (slot.task->type == SERVER_TASK_TYPE_COMPLETION || is_decision_ckpt);
 
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
@@ -4350,8 +4527,24 @@ private:
 
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
+                    // decision tasks sharing a prefix: end the batch at the shared prefix so that the next batch
+                    // starts there and a checkpoint of that state is created (never past the first read position)
+                    const int32_t n_read_first = slot.task->type == SERVER_TASK_TYPE_EMBEDDING ? slot.task->embd_reads_first() : n_decision_first;
+                    const int32_t n_ckpt_pos = !is_decision_ckpt ? -1 :
+                        (n_read_first >= 0 ? std::min(slot.task->n_tokens_ckpt, n_read_first) : slot.task->n_tokens_ckpt);
+
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                        if (n_ckpt_pos > 0 && slot.prompt.n_tokens() == n_ckpt_pos && batch.size() > n_tokens_prev) {
+                            break;
+                        }
+                        // state_bidir: a prefix block is computed in one batch (and ubatch), starting on its boundary
+                        if (slot.task->bidir_n > 0 && batch.size() > n_tokens_prev &&
+                            (slot.prompt.n_tokens() == slot.task->bidir_n ||
+                             (slot.prompt.n_tokens() < slot.task->bidir_n && slot.prompt.n_tokens() % slot.task->bidir_block == 0))) {
+                            break;
+                        }
+
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4404,7 +4597,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && !is_decision_ckpt) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -4431,6 +4624,17 @@ private:
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
 
+                    // decision tasks: checkpoint only at the shared prefix, and only once per prefix
+                    // (a checkpoint at that position always matches the current prompt - stale ones were erased above)
+                    if (is_decision_ckpt) {
+                        bool has_ckpt = false;
+                        for (const auto & cur : slot.prompt.checkpoints) {
+                            has_ckpt |= cur.n_tokens == n_ckpt_pos;
+                        }
+                        do_checkpoint = do_checkpoint && n_tokens_start == n_ckpt_pos && !has_ckpt;
+                    }
+                    const bool is_ckpt_start = is_decision_ckpt && do_checkpoint;
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -4447,7 +4651,7 @@ private:
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_user_start && !near_prompt_end && !is_ckpt_start) {
                             do_checkpoint = false;
                         }
                     }
@@ -4467,7 +4671,7 @@ private:
                     // no need to create checkpoints that are too close together, unless it's the last user message
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_last_user_message || near_prompt_end || is_ckpt_start ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
@@ -4579,12 +4783,31 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        for (auto & kv : embd_hidden_buf) {
+            kv.second.clear();
+        }
+        // state_bidir: the prefix of the (single) processing task that asks for it
+        {
+            int32_t bn = 0, bb = 0, n_bidir_slots = 0;
+            for (const auto & slot : slots) {
+                if (slot.is_processing() && slot.task && slot.task->bidir_n > 0) {
+                    bn = slot.task->bidir_n; bb = slot.task->bidir_block; n_bidir_slots++;
+                }
+            }
+            if (n_bidir_slots > 1) {
+                throw std::runtime_error("state_bidir: needs --parallel 1");
+            }
+            llama_set_bidir_prefix(ctx_tgt, bn, bb);
+        }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (ret == 0 && has_output) {
+            collect_embd_reads(batch.view);
+        }
 
         if (ret != 0) {
             {
@@ -5254,6 +5477,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.apply_chat_session(chat_session);
 
             task.id_slot = json_value(data, "id_slot", -1);
+            task.n_tokens_ckpt = std::min(json_value(data, "n_tokens_ckpt", 0), std::max(0, task.n_tokens() - 1));
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -6816,6 +7040,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
             // OAI-compat
             task.params.res_type = res_type;
             task.params.embd_normalize = embd_normalize;
+            task.n_tokens_ckpt = std::min(json_value(body, "n_tokens_ckpt", 0), std::max(0, task.n_tokens() - 1));
+            if (body.contains("state_bidir")) {
+                const int32_t bn = body.at("state_bidir").at(0).get<int32_t>();
+                const int32_t bb = body.at("state_bidir").at(1).get<int32_t>();
+                if (bn < 0 || bn > task.n_tokens() || bb <= 0) {
+                    res->error(format_error_response(string_format("state_bidir: invalid [%d, %d] for %d tokens", bn, bb, task.n_tokens()), ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                if (bn > 0 && std::min(bn, bb) > (int32_t) params.n_ubatch) {
+                    res->error(format_error_response(string_format("state_bidir: a block of %d tokens does not fit the %d-token ubatch", std::min(bn, bb), (int) params.n_ubatch), ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                task.bidir_n     = bn;
+                task.bidir_block = bb;
+            }
+            if (body.contains("embd_reads")) {
+                if (meta->pooling_type != LLAMA_POOLING_TYPE_NONE) {
+                    res->error(format_error_response("embd_reads needs --pooling none", ERROR_TYPE_INVALID_REQUEST));
+                    return res;
+                }
+                for (const auto & span : body.at("embd_reads")) {
+                    const int32_t s = span.at(0).get<int32_t>();
+                    const int32_t e = span.at(1).get<int32_t>();
+                    if (s < 0 || e <= s || e > task.n_tokens()) {
+                        res->error(format_error_response(string_format("embd_reads: invalid span [%d, %d) for %d tokens", s, e, task.n_tokens()), ERROR_TYPE_INVALID_REQUEST));
+                        return res;
+                    }
+                    task.embd_reads.emplace_back(s, e);
+                }
+            }
 
             tasks.push_back(std::move(task));
         }

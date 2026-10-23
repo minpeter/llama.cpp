@@ -29,6 +29,18 @@ static std::string decision_meta_str(const llama_model * model, const std::strin
     return n < 0 ? "" : std::string(buf);
 }
 
+// a metadata string of any length
+static std::string decision_meta_str_long(const llama_model * model, const std::string & key) {
+    const int32_t n = llama_model_meta_val_str(model, key.c_str(), nullptr, 0);
+    if (n < 0) {
+        return "";
+    }
+    std::string buf(n + 1, '\0');
+    llama_model_meta_val_str(model, key.c_str(), buf.data(), buf.size());
+    buf.resize(n);
+    return buf;
+}
+
 //
 // model-specific setup
 //
@@ -106,16 +118,26 @@ void server_decision_context::init(const llama_model * model) {
     } else if (model_type == COMMON_DECISION_TYPE_LEV || model_type == COMMON_DECISION_TYPE_GRANITE_SWITCH || model_type == COMMON_DECISION_TYPE_NIMBLE || model_type == COMMON_DECISION_TYPE_PPLX_DECIDER || model_type == COMMON_DECISION_TYPE_VLLM_D3) {
         // label codes are A..Z then AA..ZZ, only the ones that are a single token are used
         std::vector<std::string> codes;
-        for (char a = 'A'; a <= 'Z'; a++) {
-            codes.push_back(std::string(1, a));
-        }
-        for (char a = 'A'; a <= 'Z'; a++) {
-            for (char b = 'A'; b <= 'Z'; b++) {
-                codes.push_back(std::string{a, b});
+        // a model can list its own codes (space-separated), read at the token of <label_prefix><code>
+        const std::string own_codes   = decision_meta_str_long(model, prefix + "label_codes");
+        const std::string code_prefix = decision_meta_str(model, prefix + "label_prefix");
+        if (!own_codes.empty()) {
+            codes = string_split<std::string>(own_codes, ' ');
+        } else {
+            for (char a = 'A'; a <= 'Z'; a++) {
+                codes.push_back(std::string(1, a));
+            }
+            for (char a = 'A'; a <= 'Z'; a++) {
+                for (char b = 'A'; b <= 'Z'; b++) {
+                    codes.push_back(std::string{a, b});
+                }
             }
         }
         for (const auto & code : codes) {
-            const auto toks = common_tokenize(vocab, code, false, false);
+            const auto toks = common_tokenize(vocab, code_prefix + code, false, false);
+            if (!own_codes.empty() && toks.size() != 1) {
+                throw std::runtime_error(string_format("decision label '%s%s' is not a single token", code_prefix.c_str(), code.c_str()));
+            }
             if (toks.size() == 1 && labels.size() < 255) {
                 labels.push_back(toks[0]);
                 label_texts.push_back(code);
@@ -125,7 +147,7 @@ void server_decision_context::init(const llama_model * model) {
         if (model_type == COMMON_DECISION_TYPE_VLLM_D3) {
             canonical_legend = true;
         }
-        if (model_type == COMMON_DECISION_TYPE_GRANITE_SWITCH) {
+        if (model_type == COMMON_DECISION_TYPE_GRANITE_SWITCH || decision_meta_str(model, prefix + "noul_true_first") == "true") {
             noul_true_first = true;
         }
     } else if (model_type == COMMON_DECISION_TYPE_KEV) {
@@ -1587,6 +1609,19 @@ json server_decision_context::format_answer(const server_decision_question & que
 
 std::vector<server_task> server_decision_group_tasks(std::vector<server_task> && tasks, size_t n_slots) {
     n_slots = std::max(n_slots, (size_t) 1);
+
+    // the prefix shared by every task of the request: groups run one after another on the same slot(s), so a
+    // context checkpoint at this position lets each task continue from it instead of re-processing the prompt
+    if (tasks.size() >= 2) {
+        size_t n_ckpt = tasks[0].tokens.size() - 1;
+        for (size_t j = 1; j < tasks.size(); j++) {
+            n_ckpt = std::min(n_ckpt, tasks[0].tokens.get_common_prefix(tasks[j].tokens));
+            n_ckpt = std::min(n_ckpt, tasks[j].tokens.size() - 1);
+        }
+        for (auto & task : tasks) {
+            task.n_tokens_ckpt = n_ckpt;
+        }
+    }
 
     std::vector<server_task> groups;
     for (size_t i = 0; i < tasks.size(); i += n_slots) {

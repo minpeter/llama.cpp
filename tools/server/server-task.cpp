@@ -1483,10 +1483,19 @@ json server_task_result_embd::to_json() {
 }
 
 json server_task_result_embd::to_json_non_oaicompat() {
-    return json {
+    json res = json {
         {"index",     index},
         {"embedding", embedding},
     };
+    if (!hidden_layers.empty()) {
+        json h = json::object();
+        for (size_t l = 0; l < hidden_layers.size(); ++l) {
+            h[std::to_string(hidden_layers[l])] = hidden[l];
+        }
+        res["hidden"] = h; // embd_reads
+        res["n_tokens"] = n_tokens;
+    }
+    return res;
 }
 
 json server_task_result_embd::to_json_oaicompat() {
