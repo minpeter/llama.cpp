@@ -19,8 +19,9 @@ def _is_pplx_decider_checkpoint(dir_model: Path) -> bool:
     if not all((dir_model / name).is_file() for name in ("decision_config.json", "readout.safetensors", "config.json")):
         return False
     with open(dir_model / "decision_config.json", encoding="utf-8") as f:
-        # the same layout with a format_id is a vllm-d3 checkpoint
-        return "format_id" not in json.load(f)
+        # the same layout with a format_id is a vllm-d3 checkpoint, with a structure a CoCo-Decision one
+        cfg = json.load(f)
+        return "format_id" not in cfg and "structure" not in cfg
 
 
 @ModelBase.register_hparams_loader(_is_pplx_decider_checkpoint)

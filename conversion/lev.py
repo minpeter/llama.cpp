@@ -25,6 +25,12 @@ def _decision_lora_base(dir_model: Path) -> tuple[str, str | None]:
     if revision is None and (dir_model / "schema_config.json").is_file():
         with open(dir_model / "schema_config.json", encoding="utf-8") as f:
             revision = json.load(f).get("revision")
+    if revision is None and (dir_model / "sieve_config.json").is_file():
+        with open(dir_model / "sieve_config.json", encoding="utf-8") as f:
+            sieve_config = json.load(f)
+        revision = sieve_config.get("revision")
+        if sieve_config.get("base"):
+            return sieve_config["base"], revision
     return lora_config["base_model_name_or_path"], revision
 
 
