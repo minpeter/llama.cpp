@@ -1113,6 +1113,10 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // state_bidir: the first n_prefix positions attend bidirectionally within blocks of `block` positions (the rest
+    // stays causal); applies to the KV-cache attention layers of every context of the process. n_prefix 0 = off
+    LLAMA_API void llama_set_bidir_prefix(struct llama_context * ctx, int32_t n_prefix, int32_t block);
+
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 

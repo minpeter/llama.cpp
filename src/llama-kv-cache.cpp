@@ -13,6 +13,7 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <atomic>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -1556,6 +1557,15 @@ void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
     }
 }
 
+// state_bidir: bidirectional prefix blocks inside the causal mask (see llama_set_bidir_prefix)
+static std::atomic<int32_t> g_bidir_n{0};
+static std::atomic<int32_t> g_bidir_block{0};
+
+void llama_kv_cache_set_bidir_prefix(int32_t n_prefix, int32_t block) {
+    g_bidir_block = block > 0 ? block : 0;
+    g_bidir_n     = block > 0 && n_prefix > 0 ? n_prefix : 0;
+}
+
 struct args_set_input_kq_mask {
     const llama_hparams & hparams;
     const llama_ubatch  * ubatch;
@@ -1588,6 +1598,9 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
     const T mask_keep = llama_cast<T>(0.0f);
     const T mask_drop = llama_cast<T>(-INFINITY);
+
+    const int32_t bidir_n     = g_bidir_n;     // state_bidir
+    const int32_t bidir_block = g_bidir_block;
 
     // the min position in the batch for each sequence
     llama_pos seq_pos_min[LLAMA_MAX_SEQ];
@@ -1682,9 +1695,11 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
 
                 if (causal) {
-                    // mask future tokens
+                    // mask future tokens (state_bidir: except keys of the same prefix block)
                     if (p0 > p1) {
-                        goto skip;
+                        if (!(bidir_n > 0 && p0 < bidir_n && p0 / bidir_block == p1 / bidir_block)) {
+                            goto skip;
+                        }
                     }
 
                     // M-RoPE causal mask

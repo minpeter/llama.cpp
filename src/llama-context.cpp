@@ -4219,6 +4219,13 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
 
+void llama_kv_cache_set_bidir_prefix(int32_t n_prefix, int32_t block); // llama-kv-cache.cpp (state_bidir)
+
+void llama_set_bidir_prefix(llama_context * ctx, int32_t n_prefix, int32_t block) {
+    GGML_UNUSED(ctx);
+    llama_kv_cache_set_bidir_prefix(n_prefix, block);
+}
+
 bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
 }
